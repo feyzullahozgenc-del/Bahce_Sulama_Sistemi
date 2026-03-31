@@ -1,0 +1,343 @@
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+#include <NTPClient.h>
+
+// --- AYARLAR ---
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 75, 48);
+IPAddress gateway(192, 168, 75, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+IPAddress roleIP(192, 168, 75, 221);
+const int rolePort = 6722;
+
+// Hava durumu: Open-Meteo API (ücretsiz, API key yok)
+// Koordinatlar: Finike-Hasyurt/Kılıorman
+const char* weatherHost = "api.open-meteo.com";
+const char* weatherPath = "/v1/forecast?latitude=36.3435&longitude=30.2224&current=temperature_2m,weather_code,wind_speed_10m&timezone=Europe%2FIstanbul";
+
+EthernetUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 10800, 60000);
+
+const char* isimler[] = {"Sigorta", "Pompa 1", "Pompa 2", "Tahliye", "Vana 2", "Vana 3", "Vana 4", "Vana 5"};
+bool durumlar[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+unsigned long senaryoBaslangic = 0;
+unsigned long aktifBeklemeSuresi = 0;
+bool zamanlayiciAktif = false;
+String aktifSenaryoAdi = "";
+String baslangicSaati = "";
+long t_dk = 1, s_dk = 1;
+
+bool ntpHazir = false;
+
+// Hava durumu verileri (her 5 dakikada bir güncellenir)
+float hava_sicaklik = -99;
+int hava_kod = -1;
+float hava_ruzgar = -1;
+unsigned long sonHavaGuncelleme = 0;
+const unsigned long HAVA_GUNCELLEME_SURESI = 300000UL; // 5 dakika
+
+EthernetServer server(80);
+
+// --- RÖLE GÖNDER ---
+bool roleGonder(int islem, int kanal) {
+  EthernetClient rc;
+  rc.setConnectionTimeout(500);
+  if (rc.connect(roleIP, rolePort)) {
+    rc.print(String(islem) + String(kanal));
+    rc.flush(); delay(30); rc.stop();
+    durumlar[kanal - 1] = (islem == 1);
+    return true;
+  }
+  return false;
+}
+
+void tumRoleleriKapat() {
+  for (int j = 1; j <= 8; j++) {
+    if (!roleGonder(2, j)) { delay(100); roleGonder(2, j); }
+  }
+}
+
+// --- HAVA DURUMU GÜNCELLE ---
+// Open-Meteo'dan sıcaklık, weather_code ve rüzgar çeker
+// JSON parse: tam kütüphane yok, basit indexOf ile
+void havaDurumuGuncelle() {
+  EthernetClient wc;
+  wc.setConnectionTimeout(2000);
+  if (!wc.connect(weatherHost, 80)) return;
+
+  wc.print(F("GET "));
+  wc.print(weatherPath);
+  wc.println(F(" HTTP/1.1"));
+  wc.print(F("Host: ")); wc.println(weatherHost);
+  wc.println(F("Connection: close"));
+  wc.println();
+
+  unsigned long timeout = millis();
+  String body = "";
+  bool headerBitti = false;
+
+  while (wc.connected() && (millis() - timeout < 5000)) {
+    if (wc.available()) {
+      String satir = wc.readStringUntil('\n');
+      if (!headerBitti) {
+        if (satir == "\r") headerBitti = true;
+      } else {
+        body += satir;
+        if (body.length() > 600) break; // Yeterli veri geldi
+      }
+    }
+  }
+  wc.stop();
+
+  // JSON parse: "temperature_2m":XX.X
+  int idx = body.indexOf("\"temperature_2m\":");
+  if (idx != -1) {
+    idx += 17;
+    hava_sicaklik = body.substring(idx, body.indexOf(",", idx)).toFloat();
+  }
+  // "weather_code":X
+  idx = body.indexOf("\"weather_code\":");
+  if (idx != -1) {
+    idx += 15;
+    hava_kod = body.substring(idx, body.indexOf(",", idx)).toInt();
+  }
+  // "wind_speed_10m":X
+  idx = body.indexOf("\"wind_speed_10m\":");
+  if (idx != -1) {
+    idx += 17;
+    hava_ruzgar = body.substring(idx, body.indexOf(",", idx)).toFloat();
+  }
+
+  sonHavaGuncelleme = millis();
+}
+
+// WMO weather_code'u Türkçe emoji'ye çevir
+String havaIkon(int kod) {
+  if (kod == 0) return "☀️";
+  if (kod <= 3) return "⛅";
+  if (kod <= 48) return "🌫️";
+  if (kod <= 67) return "🌧️";
+  if (kod <= 77) return "❄️";
+  if (kod <= 82) return "🌦️";
+  if (kod <= 99) return "⛈️";
+  return "🌡️";
+}
+
+// --- TARİH YAZ ---
+void tarihYaz(EthernetClient& client) {
+  unsigned long epoch = timeClient.getEpochTime();
+  unsigned long days = epoch / 86400L;
+  unsigned long yr = 1970;
+  bool artik;
+  while (true) {
+    artik = ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0));
+    unsigned long yg = artik ? 366 : 365;
+    if (days < yg) break;
+    days -= yg; yr++;
+  }
+  artik = ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0));
+  int md[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (artik) md[1] = 29;
+  int mon = 0;
+  while (days >= (unsigned long)md[mon]) { days -= md[mon]; mon++; }
+  client.print(days + 1); client.print("."); client.print(mon + 1); client.print("."); client.print(yr);
+}
+
+void setup() {
+  pinMode(53, OUTPUT); digitalWrite(53, HIGH);
+  Ethernet.init(10);
+  Ethernet.begin(mac, ip, dns, gateway, subnet);
+  server.begin();
+  timeClient.begin();
+  delay(1000);
+  havaDurumuGuncelle(); // İlk veri çekimi
+}
+
+void loop() {
+  if (timeClient.update()) ntpHazir = true;
+
+  // Hava durumu: 5 dakikada bir güncelle
+  if (millis() - sonHavaGuncelleme >= HAVA_GUNCELLEME_SURESI) {
+    havaDurumuGuncelle();
+  }
+
+  // Senaryo zaman aşımı
+  if (zamanlayiciAktif && (millis() - senaryoBaslangic >= aktifBeklemeSuresi)) {
+    zamanlayiciAktif = false; aktifSenaryoAdi = "";
+    tumRoleleriKapat();
+  }
+
+  EthernetClient client = server.available();
+  if (!client) return;
+
+  // --- HTTP OKUMA (hızlı, sadece ilk satır) ---
+  // DÜZELTME: Tepkime gecikmesi için timeout çok kısa tutuldu (500ms)
+  String req = "";
+  unsigned long baglantiBas = millis();
+  while (client.connected() && (millis() - baglantiBas < 500)) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') break;
+      if (req.length() < 200) req += c;
+    }
+  }
+
+  // --- İSTEK İŞLE ---
+  if (req.indexOf("/AYAR?") != -1) {
+    int p1 = req.indexOf("t_sure=") + 7;
+    int p1e = req.indexOf("&", p1); if (p1e == -1) p1e = req.indexOf(" ", p1);
+    t_dk = constrain(req.substring(p1, p1e).toInt(), 1, 999);
+    int p2 = req.indexOf("s_sure=") + 7;
+    int p2e = req.indexOf(" ", p2);
+    s_dk = constrain(req.substring(p2, p2e).toInt(), 1, 999);
+  }
+
+  for (int i = 1; i <= 8; i++) {
+    if (req.indexOf("/R" + String(i) + "_A") != -1) roleGonder(1, i);
+    if (req.indexOf("/R" + String(i) + "_K") != -1) roleGonder(2, i);
+  }
+
+  if (req.indexOf("/STR_TAH") != -1) {
+    tumRoleleriKapat();
+    roleGonder(1, 1); roleGonder(1, 4);
+    aktifBeklemeSuresi = (unsigned long)t_dk * 60000UL;
+    senaryoBaslangic = millis(); zamanlayiciAktif = true;
+    aktifSenaryoAdi = "Tahliye";
+    baslangicSaati = ntpHazir ? timeClient.getFormattedTime() : "--:--";
+  }
+  if (req.indexOf("/STR_SUL") != -1) {
+    tumRoleleriKapat();
+    for (int i = 1; i <= 8; i++) { if (i != 4) roleGonder(1, i); }
+    aktifBeklemeSuresi = (unsigned long)s_dk * 60000UL;
+    senaryoBaslangic = millis(); zamanlayiciAktif = true;
+    aktifSenaryoAdi = "Sulama";
+    baslangicSaati = ntpHazir ? timeClient.getFormattedTime() : "--:--";
+  }
+  if (req.indexOf("/STOP_ALL") != -1) {
+    zamanlayiciAktif = false; aktifSenaryoAdi = "";
+    tumRoleleriKapat();
+  }
+
+  // --- HTML ÇIKTI ---
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/html; charset=utf-8"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  client.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"));
+  // DÜZELTME: Sayfa yenileme 5 dakikaya çıkarıldı (hava durumu ile senkron)
+  client.print(F("<meta http-equiv='refresh' content='300'>"));
+  client.print(F("<meta name='viewport' content='width=device-width,initial-scale=1'>"));
+  client.print(F("<title>Bahçe Sulama Sistemi</title>"));
+
+  // DÜZELTME: Sayaç sıfırlanma sorunu çözüldü
+  // Sayaç artık sunucudan gelen 'data-left' saniyesinden başlar,
+  // fakat her yenilemede kalan gerçek süre hesaplanarak gönderildiği için
+  // sayfa yenilenince de doğru kalan süreyi gösterir.
+  // Ek olarak: localStorage ile sekme değişiminde bile süre korunur.
+  client.print(F("<script>"));
+  client.print(F("function startTimer(d){"));
+  client.print(F("var key='saat_bitis';"));
+  client.print(F("var serverLeft=parseInt(d.getAttribute('data-left'));"));
+  // Tarayıcıda kaydedilmiş bitiş zamanı varsa onu kullan, yoksa sunucudan gelenle başlat
+  client.print(F("var now=Math.floor(Date.now()/1000);"));
+  client.print(F("var saved=localStorage.getItem(key);"));
+  client.print(F("var bitis;"));
+  client.print(F("if(saved&&(parseInt(saved)-now)>0&&Math.abs((parseInt(saved)-now)-serverLeft)<10){"));
+  client.print(F("  bitis=parseInt(saved);"));  // Tarayıcıdaki değer sunucuya yakınsa kullan
+  client.print(F("}else{"));
+  client.print(F("  bitis=now+serverLeft;"));    // Sunucudan gelen değeri kullan
+  client.print(F("  localStorage.setItem(key,bitis);"));
+  client.print(F("}"));
+  client.print(F("var itv=setInterval(function(){"));
+  client.print(F("  var t=bitis-Math.floor(Date.now()/1000);"));
+  client.print(F("  if(t<=0){d.textContent='Bitti';localStorage.removeItem(key);clearInterval(itv);return;}"));
+  client.print(F("  var m=Math.floor(t/60),s=t%60;"));
+  client.print(F("  d.textContent=(m<10?'0':'')+m+':'+(s<10?'0':'')+s;"));
+  client.print(F("},1000);}"));
+  // Senaryo yoksa localStorage temizle
+  client.print(F("function clearTimer(){localStorage.removeItem('saat_bitis');}"));
+  client.print(F("</script>"));
+
+  client.print(F("<style>"));
+  client.print(F("body{font-family:sans-serif;text-align:center;background:#1a1a1a;color:#eee;margin:0;padding:10px;}"));
+  client.print(F(".box{background:#2a2a2a;padding:10px;border-radius:10px;margin:6px auto;width:92%;border:1px solid #333;}"));
+  client.print(F(".b{padding:10px;width:70px;color:white;text-decoration:none;display:inline-block;border-radius:5px;font-weight:bold;margin:2px;}"));
+  client.print(F(".s{display:block;padding:15px;margin:10px auto;width:88%;color:white;text-decoration:none;border-radius:10px;font-weight:bold;font-size:16px;}"));
+  client.print(F(".w{background:#0d47a1;padding:10px;font-size:13px;}"));
+  client.print(F("input{background:#333;color:white;border:1px solid #555;padding:8px;width:65px;text-align:center;font-size:16px;border-radius:4px;}"));
+  client.print(F("button{padding:10px 20px;background:#1565c0;color:white;border:none;border-radius:5px;font-size:15px;cursor:pointer;}"));
+  client.print(F("</style></head>"));
+
+  // onload: sayaç varsa başlat, yoksa temizle
+  if (zamanlayiciAktif) {
+    client.print(F("<body onload='var e=document.getElementById(\"time\");if(e)startTimer(e)'>"));
+  } else {
+    client.print(F("<body onload='clearTimer()'>"));
+  }
+
+  // --- ÜST BİLGİ ÇUBUĞU ---
+  client.print(F("<div class='w'>"));
+  client.print(F("📅 "));
+  if (ntpHazir) { tarihYaz(client); client.print(F(" | 🕒 ")); client.print(timeClient.getFormattedTime()); }
+  else { client.print(F("Saat bekleniyor...")); }
+
+  // Hava durumu
+  client.print(F(" | "));
+  if (hava_sicaklik > -99) {
+    client.print(havaIkon(hava_kod));
+    client.print(F(" "));
+    client.print((int)hava_sicaklik);
+    client.print(F("°C 💨 "));
+    client.print((int)hava_ruzgar);
+    client.print(F(" km/h"));
+  } else {
+    client.print(F("🌡️ Hava yükleniyor..."));
+  }
+
+  client.print(F("<br>📍 Finike-Hasyurt/Kılıorman</div>"));
+  client.print(F("<h2>🍊 Bahçe Sulama Sistemi</h2><hr>"));
+
+  // --- AKTİF SENARYO SAYACI ---
+  if (zamanlayiciAktif) {
+    unsigned long simdi = millis();
+    long kalanSaniye = 0;
+    if ((senaryoBaslangic + aktifBeklemeSuresi) > simdi) {
+      kalanSaniye = (long)((senaryoBaslangic + aktifBeklemeSuresi - simdi) / 1000);
+    }
+    client.print(F("<div style='background:#b71c1c;padding:12px;border-radius:10px;width:90%;margin:auto;'>"));
+    client.print(F("<div style='font-size:12px;color:#ffc107;'>Başlangıç: ")); client.print(baslangicSaati); client.print(F("</div>"));
+    client.print(F("<h3 style='margin:5px 0;color:#fff;'>⏳ ")); client.print(aktifSenaryoAdi); client.print(F("</h3>"));
+    client.print(F("<span id='time' style='font-size:28px;font-weight:bold;color:#ffeb3b;' data-left='"));
+    client.print(kalanSaniye);
+    client.print(F("'>--:--</span></div><br>"));
+  }
+
+  // --- RÖLE BUTONLARI ---
+  for (int i = 0; i < 8; i++) {
+    client.print(F("<div class='box'>"));
+    client.print(durumlar[i] ? F("<b style='color:#2ecc71'>● </b>") : F("<b style='color:#555'>● </b>"));
+    client.print(isimler[i]);
+    client.print(F("<br><a class='b' style='background:#2e7d32' href='/R")); client.print(i + 1); client.print(F("_A'>AÇ</a>"));
+    client.print(F("<a class='b' style='background:#d84315' href='/R")); client.print(i + 1); client.print(F("_K'>KAPAT</a></div>"));
+  }
+
+  // --- SÜRE AYAR FORMU ---
+  client.print(F("<hr><div style='background:#333;padding:15px;border-radius:10px;width:90%;margin:auto;'>"));
+  client.print(F("<form action='/AYAR' method='get'>Süreler (Dakika):<br><br>"));
+  client.print(F("T: <input type='number' name='t_sure' min='1' max='999' value='")); client.print(t_dk); client.print(F("'> &nbsp;"));
+  client.print(F("S: <input type='number' name='s_sure' min='1' max='999' value='")); client.print(s_dk); client.print(F("'>"));
+  client.print(F("<br><br><button type='submit'>💾 KAYDET</button></form></div><hr>"));
+
+  // --- SENARYO BUTONLARI ---
+  client.print(F("<a class='s' style='background:#6a1b9a' href='/STR_TAH'>🚿 Tahliye Başlat</a>"));
+  client.print(F("<a class='s' style='background:#1b5e20' href='/STR_SUL'>💧 Sulama Başlat</a>"));
+  client.print(F("<a class='s' style='background:#b71c1c' href='/STOP_ALL'>⛔ İPTAL</a><br>"));
+
+  client.print(F("</body></html>"));
+  delay(1);
+  client.stop();
+}
