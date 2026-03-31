@@ -1,1 +1,0 @@
-# Bahce_Sulama_Sistemi
